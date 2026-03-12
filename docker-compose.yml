@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8000"
+    volumes:
+      - ./materials:/app/materials
+      - ./backend:/app/backend
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
+      - DB_PATH=/app/materials
+      - DOCKER_ENV=true
+    working_dir: /app/backend
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5174:80"
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8080
+    depends_on:
+      - backend
+    restart: unless-stopped
