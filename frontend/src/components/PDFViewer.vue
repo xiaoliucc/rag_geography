@@ -55,8 +55,12 @@
     const emit = defineEmits(['close', 'update:pageNum'])
 
     const pageImageUrl = computed(() => {
-        // 使用环境变量或默认本地开发地址
-        const baseURL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+        // 使用环境变量或当前页面域名
+        let baseURL = import.meta.env.VITE_API_BASE_URL
+        if (!baseURL) {
+            // 获取当前页面的域名和协议
+            baseURL = `${window.location.protocol}//${window.location.host}`
+        }
         return `${baseURL}/api/pdf/${props.textbook}/${props.pageNum}?t=${Date.now()}`
     })
 
