@@ -41,11 +41,16 @@ if os.path.exists(default_materials_path):
 class QueryRequest(BaseModel):
     query: str
     top_k: int = 5
+    documents: list = None
+    distances: list = None
+
+
+import time
 
 
 @app.post("/api/search")
 async def api_search(request: QueryRequest):
-    search_results = search(request.query, request.top_k)
+    search_results = await search(request.query, request.top_k)
     print("search_results:", search_results)
     if search_results is None:
         return {
@@ -62,17 +67,33 @@ async def api_search(request: QueryRequest):
 
 @app.post("/api/generate")
 async def api_generate(request: QueryRequest):
-    search_results = search(request.query, request.top_k)
-    if search_results is None:
-        documents = []
-        distances = []
+    # 开始总计时（包括搜索和生成）
+    total_start_time = time.time()
+
+    if request.documents:
+        documents = request.documents
+        distances = request.distances
     else:
+        search_results = await search(request.query, request.top_k)
         documents = search_results["documents"][0]
         distances = search_results["distances"][0]
 
     def generate():
+        # 开始生成计时
+        generate_start_time = time.time()
+
         for chunk in generate_answer_stream(request.query, documents, distances):
             yield f"data: {json.dumps({'chunk': chunk}, ensure_ascii=False)}\n\n"
+
+        # 结束生成计时
+        generate_end_time = time.time()
+        generate_time = generate_end_time - generate_start_time
+        print(f"生成回答耗时: {generate_time:.2f} 秒")
+
+        # 结束总计时
+        total_end_time = time.time()
+        total_time = total_end_time - total_start_time
+        print(f"总耗时（搜索+生成）: {total_time:.2f} 秒")
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 

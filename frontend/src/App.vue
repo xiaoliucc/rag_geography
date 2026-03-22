@@ -276,6 +276,8 @@
         },
         body: JSON.stringify({
           query: query.value,
+          documents: documents.value,
+          distances: distances.value,
           top_k: 5
         })
       })

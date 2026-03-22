@@ -5,6 +5,8 @@ from http import HTTPStatus
 import os
 import logging
 import sys
+import asyncio
+import asyncio.subprocess
 
 # ====================== 配置区域 ======================
 # 请在这里填入你的火山引擎 API Key
@@ -43,14 +45,26 @@ def get_all_vector_dbs() -> list:
     return vector_dbs
 
 
+# 全局缓存
+query_rewrite_cache = {}  # 缓存查询重写结果
+text_embedding_cache = {}  # 缓存文本向量化结果
+
+
 def embed_text(text):
     """
     :param text: 输入文本
     :return: 文本的向量表示（如果成功），否则 None
     """
+    # 检查缓存
+    if text in text_embedding_cache:
+        return text_embedding_cache[text]
+
     resp = dashscope.TextEmbedding.call(model="text-embedding-v4", input=text)
     if resp.status_code == HTTPStatus.OK:
-        return resp.output["embeddings"][0]["embedding"]
+        embedding = resp.output["embeddings"][0]["embedding"]
+        # 存入缓存
+        text_embedding_cache[text] = embedding
+        return embedding
     else:
         print(f"向量化错误: {resp.code} - {resp.message}")
         return None
@@ -63,6 +77,10 @@ def rewrite_query(original_query):
     :param original_query: 原始用户问题
     :return: 重写后的查询
     """
+    # 检查缓存
+    if original_query in query_rewrite_cache:
+        return query_rewrite_cache[original_query]
+
     prompt = f"""你是一个专业的查询优化助手。请对以下高中地理问题进行优化，使其更适合在教材中检索相关内容。
 
 原始问题：{original_query}
@@ -75,12 +93,14 @@ def rewrite_query(original_query):
 
     try:
         resp = dashscope.Generation.call(
-            model="qwen-max", prompt=prompt, temperature=0.3, max_tokens=200
+            model="qwen-turbo", prompt=prompt, temperature=0.3, max_tokens=200
         )
         if resp.status_code == HTTPStatus.OK:
             rewritten = resp.output.text.strip()
             print(f"[查询重写] 原始: {original_query}")
             print(f"[查询重写] 优化: {rewritten}")
+            # 存入缓存
+            query_rewrite_cache[original_query] = rewritten
             return rewritten
     except Exception as e:
         print(f"[查询重写] 失败: {e}")
@@ -115,7 +135,7 @@ def rerank(query, docs, metadatas, distances, top_k=5):
 
         try:
             resp = dashscope.Generation.call(
-                model="qwen-max", prompt=prompt, temperature=0.1, max_tokens=10
+                model="qwen-turbo", prompt=prompt, temperature=0.1, max_tokens=10
             )
             if resp.status_code == HTTPStatus.OK:
                 score_text = resp.output.text.strip()
@@ -146,8 +166,39 @@ def rerank(query, docs, metadatas, distances, top_k=5):
     return top_docs, top_metadatas, top_scores
 
 
-def search(query_text, top_k=10, enable_rewrite=True, enable_rerank=True):
+async def search_db(vector_db_path, query_embedding, retrieve_k):
+    """异步处理单个数据库的检索"""
+    try:
+        client = chromadb.PersistentClient(path=vector_db_path)
+        print(f"数据库路径: {vector_db_path}")
+        collections = client.list_collections()
+
+        db_results = []
+        for collection in collections:
+            print(f"集合名称: {collection.name}")
+            collection = client.get_collection(name=collection.name)
+
+            # 检索（召回更多结果供重排序）
+            print(f"正在检索 Top-{retrieve_k} 结果...")
+            results = collection.query(
+                query_embeddings=[query_embedding], n_results=retrieve_k
+            )
+
+            db_results.append(results)
+
+        return db_results
+    except Exception as e:
+        print(f"检索数据库 {vector_db_path} 失败: {e}")
+        return []
+
+
+async def search(query_text, top_k=10, enable_rewrite=True, enable_rerank=True):
     """在向量数据库中检索（含查询重写和重排序）"""
+    import time
+
+    # 开始计时
+    start_time = time.time()
+
     # 1. 查询重写
     search_query = query_text
     if enable_rewrite:
@@ -158,42 +209,36 @@ def search(query_text, top_k=10, enable_rewrite=True, enable_rerank=True):
     if query_embedding is None:
         return None
 
-    # 3. 初始化 ChromaDB 并从所有数据库检索
+    # 3. 获取所有向量数据库
     vector_db_paths = get_all_vector_dbs()
+    if not vector_db_paths:
+        print("未找到任何向量数据库")
+        return None
+
+    # 4. 并行检索所有数据库
+    retrieve_k = top_k * 1 if enable_rerank else top_k
+    tasks = [
+        search_db(db_path, query_embedding, retrieve_k) for db_path in vector_db_paths
+    ]
+    all_db_results = await asyncio.gather(*tasks)
+
+    # 5. 合并所有数据库的结果
     all_docs = []
     all_metadatas = []
     all_distances = []
 
-    for vector_db_path in vector_db_paths:
-        try:
-            client = chromadb.PersistentClient(path=vector_db_path)
-            print(f"数据库路径: {vector_db_path}")
-            collections = client.list_collections()
-
-            for collection in collections:
-                print(f"集合名称: {collection.name}")
-                collection = client.get_collection(name=collection.name)
-
-                # 4. 检索（召回更多结果供重排序）
-                retrieve_k = top_k * 2 if enable_rerank else top_k
-                print(f"正在检索 Top-{retrieve_k} 结果...")
-                results = collection.query(
-                    query_embeddings=[query_embedding], n_results=retrieve_k
-                )
-
-                # 收集结果
-                all_docs.extend(results["documents"][0])
-                all_metadatas.extend(results["metadatas"][0])
-                all_distances.extend(results["distances"][0])
-        except Exception as e:
-            print(f"检索数据库 {vector_db_path} 失败: {e}")
+    for db_results in all_db_results:
+        for collection_results in db_results:
+            all_docs.extend(collection_results["documents"][0])
+            all_metadatas.extend(collection_results["metadatas"][0])
+            all_distances.extend(collection_results["distances"][0])
 
     # 检查是否有结果
     if not all_docs:
         print("未检索到任何结果")
         return None
 
-    # 5. 重排序
+    # 6. 重排序
     if enable_rerank and len(all_docs) > 0:
         docs, metadatas, scores = rerank(
             query_text, all_docs, all_metadatas, all_distances, top_k
@@ -210,6 +255,11 @@ def search(query_text, top_k=10, enable_rewrite=True, enable_rerank=True):
         "metadatas": [metadatas],
         "distances": [all_distances],
     }
+
+    # 结束计时并打印
+    end_time = time.time()
+    total_time = end_time - start_time
+    print(f"检索总耗时: {total_time:.2f} 秒")
 
     return results
 
@@ -288,13 +338,18 @@ def generate_answer_stream(query, context_docs, distances=None):
 
 def rag_query(query, top_k=5):
     """完整的 RAG 查询流程（流式输出）"""
+    import time
+
+    # 开始计时
+    start_time = time.time()
+
     print("=" * 80)
     print(f"用户问题: {query}")
     print("=" * 80)
 
-    # 1. 检索
+    # 1. 检索（异步）
     print("\n[1/3] 正在检索相关资料...")
-    search_results = search(query, top_k)
+    search_results = asyncio.run(search(query, top_k))
     if search_results is None:
         return
 
@@ -329,6 +384,11 @@ def rag_query(query, top_k=5):
         print(f"    页码: {metadata['page_num']}")
         print(f"    {context_docs[i][:150]}...")
         print(f"    相关度距离: {distances[i]:.4f}")
+
+    # 结束计时并计算总耗时
+    end_time = time.time()
+    total_time = end_time - start_time
+    print(f"\n\n总耗时: {total_time:.2f} 秒")
 
     return full_answer  # 如果需要，可以返回完整回答
 
