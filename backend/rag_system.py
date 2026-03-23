@@ -59,7 +59,7 @@ def embed_text(text):
     if text in text_embedding_cache:
         return text_embedding_cache[text]
 
-    resp = dashscope.TextEmbedding.call(model="text-embedding-v4", input=text)
+    resp = dashscope.TextEmbedding.call(model="text-embedding-v3", input=text)
     if resp.status_code == HTTPStatus.OK:
         embedding = resp.output["embeddings"][0]["embedding"]
         # 存入缓存
