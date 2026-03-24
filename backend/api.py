@@ -50,8 +50,9 @@ import time
 
 @app.post("/api/search")
 async def api_search(request: QueryRequest):
+    print(f"[API] 接收到搜索请求: {request.query}")
     search_results = await search(request.query, request.top_k)
-    print("search_results:", search_results)
+    print("[API] 搜索结果:", search_results)
     if search_results is None:
         return {
             "documents": [],
@@ -67,13 +68,16 @@ async def api_search(request: QueryRequest):
 
 @app.post("/api/generate")
 async def api_generate(request: QueryRequest):
+    print(f"[API] 接收到生成请求: {request.query}")
     # 开始总计时（包括搜索和生成）
     total_start_time = time.time()
 
     if request.documents:
         documents = request.documents
         distances = request.distances
+        print(f"[API] 使用前端传递的 {len(documents)} 个文档")
     else:
+        print("[API] 前端未传递文档，重新搜索")
         search_results = await search(request.query, request.top_k)
         documents = search_results["documents"][0]
         distances = search_results["distances"][0]

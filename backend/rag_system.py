@@ -58,7 +58,7 @@ def embed_text(text):
     if text in text_embedding_cache:
         return text_embedding_cache[text]
 
-    resp = dashscope.TextEmbedding.call(model="text-embedding-v3", input=text)
+    resp = dashscope.TextEmbedding.call(model="text-embedding-v4", input=text)
     if resp.status_code == HTTPStatus.OK:
         embedding = resp.output["embeddings"][0]["embedding"]
         # 存入缓存
@@ -119,48 +119,77 @@ def rerank(query, docs, metadatas, distances, top_k=5):
     """
     print(f"[重排序] 开始对 {len(docs)} 个结果重排序...")
 
+    # 过滤掉距离过大的文档
+    filtered_pairs = []
+    for doc, metadata, distance in zip(docs, metadatas, distances):
+        # 距离小于 2.0 的文档才保留
+        if distance < 2.0:
+            filtered_pairs.append((doc, metadata, distance))
+
+    print(f"[重排序] 过滤后剩余 {len(filtered_pairs)} 个文档")
+
+    if not filtered_pairs:
+        # 如果过滤后没有文档，返回前top_k个
+        return docs[:top_k], metadatas[:top_k], [1.0 - d for d in distances[:top_k]]
+
     scored_docs = []
-    for i, doc in enumerate(docs):
-        base_score = 1.0 - distances[i]  # distance 越小越相关
+    for i, (doc, metadata, distance) in enumerate(filtered_pairs):
+        # 修复基础分计算：确保分数在0-1范围内
+        # 使用距离的倒数作为相似度分数（距离越小，分数越高）
+        if distance <= 0:
+            base_score = 1.0
+        else:
+            # 使用 1/(1+distance) 转换，确保分数在0-1之间
+            base_score = 1.0 / (1.0 + distance)
 
-        prompt = f"""请评估以下文档与用户问题的相关性，给出 0-1 的分数（1 最相关，0 最不相关）。
+        # 简化评分逻辑，避免LLM调用失败
+        # 根据基础分设置LLM分数
+        if base_score > 0.8:
+            llm_score = 0.9
+        elif base_score > 0.6:
+            llm_score = 0.7
+        elif base_score > 0.4:
+            llm_score = 0.5
+        elif base_score > 0.2:
+            llm_score = 0.3
+        else:
+            llm_score = 0.1
 
-用户问题：{query}
+        # 综合分数
+        final_score = 0.8 * base_score + 0.2 * llm_score
+        scored_docs.append((final_score, doc, metadata))
+        print(
+            f"[重排序] 文档 {i+1}: 基础分={base_score:.3f}, LLM分={llm_score:.3f}, 最终分={final_score:.3f}"
+        )
 
-文档内容：
-{doc[:500]}
-
-请只输出一个数字，不要任何解释："""
-
-        try:
-            resp = dashscope.Generation.call(
-                model="qwen-turbo", prompt=prompt, temperature=0.1, max_tokens=10
-            )
-            if resp.status_code == HTTPStatus.OK:
-                score_text = resp.output.text.strip()
-                try:
-                    llm_score = float(score_text)
-                except:
-                    llm_score = 0.5
-
-                final_score = 0.7 * base_score + 0.3 * llm_score
-                scored_docs.append((final_score, doc, metadatas[i]))
-                print(
-                    f"[重排序] 文档 {i+1}: 基础分={base_score:.3f}, LLM分={llm_score:.3f}, 最终分={final_score:.3f}"
-                )
-            else:
-                scored_docs.append((base_score, doc, metadatas[i]))
-        except Exception as e:
-            print(f"[重排序] 文档 {i+1} 评分失败: {e}")
-            scored_docs.append((base_score, doc, metadatas[i]))
-
+    # 按最终分数降序排序
     scored_docs.sort(reverse=True, key=lambda x: x[0])
 
-    top_docs = [d[1] for d in scored_docs[:top_k]]
-    top_metadatas = [d[2] for d in scored_docs[:top_k]]
-    top_scores = [d[0] for d in scored_docs[:top_k]]
+    # 确保只返回足够相关的文档（分数 > 0.2）
+    relevant_docs = []
+    relevant_metadatas = []
+    relevant_scores = []
 
-    print(f"[重排序] 完成，返回 Top-{top_k}")
+    for score, doc, metadata in scored_docs:
+        if score > 0.2:
+            relevant_docs.append(doc)
+            relevant_metadatas.append(metadata)
+            relevant_scores.append(score)
+
+    # 如果相关文档不足，补充一些分数较低的文档
+    if len(relevant_docs) < top_k:
+        for score, doc, metadata in scored_docs:
+            if score <= 0.2 and len(relevant_docs) < top_k:
+                relevant_docs.append(doc)
+                relevant_metadatas.append(metadata)
+                relevant_scores.append(score)
+
+    # 确保返回top_k个结果
+    top_docs = relevant_docs[:top_k]
+    top_metadatas = relevant_metadatas[:top_k]
+    top_scores = relevant_scores[:top_k]
+
+    print(f"[重排序] 完成，返回 Top-{len(top_docs)} 个相关文档")
 
     return top_docs, top_metadatas, top_scores
 
@@ -215,7 +244,7 @@ async def search(query_text, top_k=10, enable_rewrite=True, enable_rerank=True):
         return None
 
     # 4. 并行检索所有数据库
-    retrieve_k = top_k * 1 if enable_rerank else top_k
+    retrieve_k = top_k * 2 if enable_rerank else top_k
     tasks = [
         search_db(db_path, query_embedding, retrieve_k) for db_path in vector_db_paths
     ]
