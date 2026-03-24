@@ -9,7 +9,6 @@ import asyncio
 import asyncio.subprocess
 
 # ====================== 配置区域 ======================
-# 请在这里填入你的火山引擎 API Key
 dashscope.api_key = os.getenv("DASHSCOPE_API_KEY")
 # =====================================================
 
